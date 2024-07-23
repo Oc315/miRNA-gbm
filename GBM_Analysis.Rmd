@@ -1,0 +1,1847 @@
+---
+title: "GBM Initial Analysis"
+author: "Oceanus Zhang"
+date: "2024-02-18"
+output: html_document
+---
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+## 1. Data Preprocessing: Preperation & Transformation & Mean Calculation
+```{r}
+# Packgage Preperation
+library(ggplot2)
+library(dplyr)
+library(tidyverse)
+library(ComplexHeatmap)
+library(factoextra)
+library(ggpmisc)
+library(edgeR)
+library(limma)
+rm(list=ls())
+
+# Import and read in Data
+GBM_data <- "/Users/oceanuszhang/Library/CloudStorage/OneDrive-EmoryUniversity/MPH 1st Year/24Spring/GBM/GBM_Oceanus/GBM_DATA_OC/GBM_normalized.csv"
+GBM_norm <- read.csv(GBM_data, row.names = 1) 
+
+# Change all 0 to 1 in the dataframe
+GBM_norm[GBM_norm == 0] <- 1
+
+# Apply log2 to all numeric values in the dataframe
+numeric_columns <- sapply(GBM_norm, is.numeric)
+GBM_log2 <- GBM_norm  # Create a copy for transformation
+GBM_log2[, numeric_columns] <- log2(GBM_norm[, numeric_columns])
+
+# Check the first few rows to confirm the transformation
+#head(GBM_log2)
+
+### Mean Calculation
+# Step 1: Create a list of unique variable base names
+  base_names <- unique(sub("\\.\\d+$", "", names(GBM_log2)))
+
+# Step 2: Initialize an empty data frame to store means
+mean_values_df <- data.frame(matrix(ncol = length(base_names), nrow = nrow(GBM_log2)))
+names(mean_values_df) <- base_names
+GBM_log2[GBM_log2==0] <- NA
+
+# Step 3: Loop through each base name, calculate mean of replicates, and store in new data frame
+for(base_name in base_names) {
+  # Check if the base_name is "X", handle it differently
+  if(base_name == "X") {
+    # Directly assign the "X" column to mean_values_df since it has no replicates
+    mean_values_df[[base_name]] <- GBM_log2[["X"]]
+  } else {
+    # For other variables, continue with the existing logic
+    pattern <- paste0("^", base_name, "\\.\\d+$")
+    column_indices <- grep(pattern, names(GBM_log2))
+    
+    if(length(column_indices) > 0) {
+      replicate_cols <- GBM_log2[, column_indices, drop = FALSE]
+      
+      # Ensure that replicate_cols contains only numeric data
+      if(all(sapply(replicate_cols, is.numeric))) {
+        # Calculate mean across these numeric columns (row-wise mean)
+        mean_values_df[[base_name]] <- rowMeans(replicate_cols, na.rm = TRUE)
+      } else {
+        mean_values_df[[base_name]] <- NA  # Adjust as needed for non-numeric data
+      }
+    } else {
+      mean_values_df[[base_name]] <- NA  # Handle case where no columns match
+    }
+  }
+}
+
+# Convert mean_values_df to a dataframe and change all NAN to 0
+mean_values_df <- as.data.frame(mean_values_df)
+mean_values_df <- lapply(mean_values_df, function(x) {
+  x[is.nan(x)] <- 0
+  return(x)
+})
+# Convert back to a dataframe
+mean_values_df <- as.data.frame(mean_values_df)
+
+
+# Directly use row names from GBM_log2 as gene names
+gene_names <- rownames(GBM_log2)
+
+# Ensure mean_values_df is prepared to accept gene names correctly
+# This adds gene names as a new column to mean_values_df, aligning by row
+mean_values_df <- data.frame(Gene_Name = gene_names, mean_values_df)
+
+```
+
+## 2. Overall Exploratory Data Analysis (EDA)
+```{r}
+#mean_values_df <- mean_values_df %>%
+#rename(Gene_Name = X)
+
+summary(mean_values_df[, -which(names(mean_values_df) == "Gene_Name")])
+
+
+# Reshape data to long format
+long_data <- mean_values_df %>%
+  pivot_longer(cols = -Gene_Name, names_to = "Variable", values_to = "Expression_Level") %>%
+  mutate(
+    Condition = case_when(
+      str_detect(Variable, "\\.B\\.") ~ "Bioprint",
+      str_detect(Variable, "\\.N\\.") ~ "Neurosphere",
+      str_detect(Variable, "\\.M\\.") ~ "Microtumor",
+      str_detect(Variable, "\\.G\\.") ~ "Geltrex"
+    ),
+    Sub_Condition = case_when(
+      str_detect(Variable, "\\.H$") ~ "Hypoxia",
+      str_detect(Variable, "\\.N$") ~ "Normoxia"
+    )
+  )
+
+long_data %>%
+  group_by(Condition, Sub_Condition) %>%
+  summarise(Average = mean(Expression_Level, na.rm = TRUE),
+            SD = sd(Expression_Level, na.rm = TRUE))
+
+### Distribution Visualization:
+filtered_long_data <- long_data %>%
+  filter(!is.na(Expression_Level) & !is.na(Condition) & !is.na(Sub_Condition))
+
+filtered_long_data <- filtered_long_data %>% dplyr::rename(Xenoline = Variable)
+
+# Distribution of Expression level
+ggplot(filtered_long_data, aes(x = Expression_Level, fill = Condition)) + 
+  geom_density(alpha = 0.5) +
+  facet_grid(Condition ~ Sub_Condition) +
+  theme_minimal() +
+  labs(title = "Density of Expression Levels Across All Conditions Excluding NAs", 
+       x = "Log2 Expression Level", y = "Density") +
+  theme(legend.position = "bottom") +
+  guides(fill = guide_legend(nrow = 1, byrow = TRUE))
+
+# 
+ggplot(filtered_long_data, aes(x = Condition, y = Expression_Level, fill = Sub_Condition)) +
+  geom_boxplot() +
+  facet_wrap(~ Sub_Condition, scales = "free") +
+  theme_minimal() +
+  labs(title = "Expression Levels Across Conditions and Sub-Conditions Excluding NAs",
+       x = "Condition", y = "Log2 Expression Level") +
+  scale_fill_manual(values = c("Hypoxia" = "red", "Normoxia" = "blue"))
+```
+
+## 3. Specific EDA for each tumor
+```{r}
+data_XD456 <- filtered_long_data %>%
+  filter(grepl("XD456", Xenoline))
+
+data_X1441 <- filtered_long_data %>%
+  filter(grepl("X1441", Xenoline))
+
+data_JX39P <- filtered_long_data %>%
+  filter(grepl("JX39P", Xenoline))
+
+# overall summary statistics
+summary(data_XD456)
+summary(data_X1441)
+summary(data_JX39P)
+
+# XD456
+XD456_N <- filter(data_XD456, Sub_Condition == "Normoxia")
+XD456_H <- filter(data_XD456, Sub_Condition == "Hypoxia")
+XD456_aligned <- merge(XD456_N, XD456_H, by = "Gene_Name", suffixes = c("_N", "_H"))
+XD456_aligned <- XD456_aligned %>%
+  distinct(Gene_Name, Expression_Level_N, .keep_all = TRUE)
+XD456_aligned <- XD456_aligned %>%
+  distinct(Gene_Name, Expression_Level_H, .keep_all = TRUE)
+# Calculation
+XD456_lm_model <- lm(Expression_Level_H ~ Expression_Level_N, data = XD456_aligned)
+intercept <- coef(XD456_lm_model)[1]
+slope <- coef(XD456_lm_model)[2]
+XD456_summary_lm <- summary(XD456_lm_model)
+XD456_r_squared <- XD456_summary_lm$r.squared
+# Plot
+ggplot(XD456_aligned, aes(x = Expression_Level_N, y = Expression_Level_H)) +
+  geom_point(shape = 21, color = "black", fill = "darkgreen", size = 1, stroke = 0.5) +
+  geom_smooth(method = "lm", se = FALSE, color = "gray") +
+  annotate("text", x = Inf, y = Inf, hjust = 1.1, vjust = 1.1,
+           label = paste("y =", round(slope, 2), "*x +", round(intercept, 2), "\nR^2 =", round(XD456_r_squared, 2)),
+           size = 3) +
+  theme_minimal() +
+  labs(title = "Joint Scatter Plot of Expression Levels for XD456: Normoxia vs. Hypoxia",
+       x = "Expression Level in Normoxia (XD456_N)",
+       y = "Expression Level in Hypoxia (XD456_H)") +
+  xlim(-5, 15) +  # Set x-axis limits
+  ylim(-5, 15)    # Set y-axis limits
+ggsave("XD456_plot.png", width = 8, height = 6, units = "in")
+
+
+# X1441
+X1441_N <- filter(data_X1441, Sub_Condition == "Normoxia")
+X1441_H <- filter(data_X1441, Sub_Condition == "Hypoxia")
+X1441_aligned <- merge(X1441_N, X1441_H, by = "Gene_Name", suffixes = c("_N", "_H"))
+X1441_aligned <- X1441_aligned %>%
+  distinct(Gene_Name, Expression_Level_N, .keep_all = TRUE)
+X1441_aligned <- X1441_aligned %>%
+  distinct(Gene_Name, Expression_Level_H, .keep_all = TRUE)
+# Calculation
+X1441_lm_model <- lm(Expression_Level_H ~ Expression_Level_N, data = X1441_aligned)
+intercept <- coef(X1441_lm_model)[1]
+slope <- coef(X1441_lm_model)[2]
+X1441_summary_lm <- summary(X1441_lm_model)
+X1441_r_squared <- X1441_summary_lm$r.squared
+# Plot
+ggplot(X1441_aligned, aes(x = Expression_Level_N, y = Expression_Level_H)) +
+  geom_point(shape = 21, color = "black", fill = "darkgreen", size = 1, stroke = 0.5) +
+  geom_smooth(method = "lm", se = FALSE, color = "gray") +
+  annotate("text", x = Inf, y = Inf, hjust = 1.1, vjust = 1.1,
+           label = paste("y =", round(slope, 2), "*x +", round(intercept, 2), "\nR^2 =", round(X1441_r_squared, 2)),
+           size = 3) +
+  theme_minimal() +
+  labs(title = "Joint Scatter Plot of Expression Levels for X1441: Normoxia vs. Hypoxia",
+       x = "Expression Level in Normoxia (X1441)",
+       y = "Expression Level in Hypoxia (X1441)")+
+  xlim(-5, 15) +  # Set x-axis limits
+  ylim(-5, 15)    # Set y-axis limits
+ggsave("X1441_plot.png", width = 8, height = 6, units = "in")
+
+
+# JX39P
+JX39P_N <- filter(data_JX39P, Sub_Condition == "Normoxia")
+JX39P_H <- filter(data_JX39P, Sub_Condition == "Hypoxia")
+JX39P_aligned <- merge(JX39P_N, JX39P_H, by = "Gene_Name", suffixes = c("_N", "_H"))
+JX39P_aligned <- JX39P_aligned %>%
+  distinct(Gene_Name, Expression_Level_N, .keep_all = TRUE)
+JX39P_aligned <- JX39P_aligned %>%
+  distinct(Gene_Name, Expression_Level_H, .keep_all = TRUE)
+# Calculation
+JX39P_lm_model <- lm(Expression_Level_H ~ Expression_Level_N, data = JX39P_aligned)
+intercept <- coef(JX39P_lm_model)[1]
+slope <- coef(JX39P_lm_model)[2]
+JX39P_summary_lm <- summary(JX39P_lm_model)
+JX39P_r_squared <- JX39P_summary_lm$r.squared
+# Plot
+ggplot(JX39P_aligned, aes(x = Expression_Level_N, y = Expression_Level_H)) +
+  geom_point(shape = 21, color = "black", fill = "darkgreen", size = 1, stroke = 0.5) +
+  geom_smooth(method = "lm", se = FALSE, color = "gray") +
+  annotate("text", x = Inf, y = Inf, hjust = 1.1, vjust = 1.1,
+           label = paste("y =", round(slope, 2), "*x +", round(intercept, 2), "\nR^2 =", round(JX39P_r_squared, 2)),
+           size = 3) +
+  theme_minimal() +
+  labs(title = "Joint Scatter Plot of Expression Levels for JX39P: Normoxia vs. Hypoxia",
+       x = "Expression Level in Normoxia (JX39P)",
+       y = "Expression Level in Hypoxia (JX39P)")+
+  xlim(-5, 15) +  # Set x-axis limits
+  ylim(-5, 15)    # Set y-axis limits
+ggsave("JX39P_plot.png", width = 8, height = 6, units = "in")
+
+```
+## Density Plot
+```{r}
+library(ggplot2)
+library(viridis)
+library(ggpointdensity)
+# XD456
+XD456_N <- filter(data_XD456, Sub_Condition == "Normoxia")
+XD456_H <- filter(data_XD456, Sub_Condition == "Hypoxia")
+XD456_aligned <- merge(XD456_N, XD456_H, by = "Gene_Name", suffixes = c("_N", "_H"))
+XD456_aligned <- XD456_aligned %>%
+  distinct(Gene_Name, Expression_Level_N, .keep_all = TRUE)
+XD456_aligned <- XD456_aligned %>%
+  distinct(Gene_Name, Expression_Level_H, .keep_all = TRUE)
+# Calculation
+XD456_lm_model <- lm(Expression_Level_H ~ Expression_Level_N, data = XD456_aligned)
+intercept <- coef(XD456_lm_model)[1]
+slope <- coef(XD456_lm_model)[2]
+XD456_summary_lm <- summary(XD456_lm_model)
+XD456_r_squared <- XD456_summary_lm$r.squared
+# Plot
+ggplot(XD456_aligned, aes(x = Expression_Level_N, y = Expression_Level_H)) +
+  geom_point(shape = 21, size = 1, stroke = 0.5) +
+  geom_smooth(method = "lm", se = FALSE) +
+  annotate("text", x = Inf, y = Inf, hjust = 1.1, vjust = 1.1,
+           label = paste("y =", round(slope, 2), "*x +", round(intercept, 2), "\nR^2 =", round(XD456_r_squared, 2)),
+           size = 3) +
+ geom_pointdensity() +
+  scale_color_viridis()+
+  theme_minimal() +
+  labs(title = "Joint Scatter Plot of Expression Levels for XD456: Normoxia vs. Hypoxia",
+       x = "Expression Level in Normoxia (XD456_N)",
+       y = "Expression Level in Hypoxia (XD456_H)") +
+  xlim(-5, 15) +  # Set x-axis limits
+  ylim(-5, 15)    # Set y-axis limits
+ggsave("XD456_plot.png", width = 8, height = 6, units = "in")
+
+
+# X1441
+X1441_N <- filter(data_X1441, Sub_Condition == "Normoxia")
+X1441_H <- filter(data_X1441, Sub_Condition == "Hypoxia")
+X1441_aligned <- merge(X1441_N, X1441_H, by = "Gene_Name", suffixes = c("_N", "_H"))
+X1441_aligned <- X1441_aligned %>%
+  distinct(Gene_Name, Expression_Level_N, .keep_all = TRUE)
+X1441_aligned <- X1441_aligned %>%
+  distinct(Gene_Name, Expression_Level_H, .keep_all = TRUE)
+# Calculation
+X1441_lm_model <- lm(Expression_Level_H ~ Expression_Level_N, data = X1441_aligned)
+intercept <- coef(X1441_lm_model)[1]
+slope <- coef(X1441_lm_model)[2]
+X1441_summary_lm <- summary(X1441_lm_model)
+X1441_r_squared <- X1441_summary_lm$r.squared
+# Plot
+ggplot(X1441_aligned, aes(x = Expression_Level_N, y = Expression_Level_H)) +
+  geom_point(shape = 21, size = 1, stroke = 0.5) +
+  geom_smooth(method = "lm", se = FALSE) +
+  annotate("text", x = Inf, y = Inf, hjust = 1.1, vjust = 1.1,
+           label = paste("y =", round(slope, 2), "*x +", round(intercept, 2), "\nR^2 =", round(X1441_r_squared, 2)),
+           size = 3) +
+ geom_pointdensity() +
+  scale_color_viridis()+
+  theme_minimal() +
+  labs(title = "Joint Scatter Plot of Expression Levels for X1441: Normoxia vs. Hypoxia",
+       x = "Expression Level in Normoxia (X1441)",
+       y = "Expression Level in Hypoxia (X1441)")+
+  xlim(-5, 15) +  # Set x-axis limits
+  ylim(-5, 15)    # Set y-axis limits
+ggsave("X1441_plot.png", width = 8, height = 6, units = "in")
+
+
+# JX39P
+JX39P_N <- filter(data_JX39P, Sub_Condition == "Normoxia")
+JX39P_H <- filter(data_JX39P, Sub_Condition == "Hypoxia")
+JX39P_aligned <- merge(JX39P_N, JX39P_H, by = "Gene_Name", suffixes = c("_N", "_H"))
+JX39P_aligned <- JX39P_aligned %>%
+  distinct(Gene_Name, Expression_Level_N, .keep_all = TRUE)
+JX39P_aligned <- JX39P_aligned %>%
+  distinct(Gene_Name, Expression_Level_H, .keep_all = TRUE)
+# Calculation
+JX39P_lm_model <- lm(Expression_Level_H ~ Expression_Level_N, data = JX39P_aligned)
+intercept <- coef(JX39P_lm_model)[1]
+slope <- coef(JX39P_lm_model)[2]
+JX39P_summary_lm <- summary(JX39P_lm_model)
+JX39P_r_squared <- JX39P_summary_lm$r.squared
+# Plot
+ggplot(JX39P_aligned, aes(x = Expression_Level_N, y = Expression_Level_H)) +
+  geom_point(shape = 21, size = 0.5, stroke = 0.5) +
+  geom_smooth(method = "lm", se = FALSE) +
+ geom_pointdensity() +
+  scale_color_viridis() +
+  annotate("text", x = Inf, y = Inf, hjust = 1.1, vjust = 1.1,
+           label = paste("y =", round(slope, 2), "*x +", round(intercept, 2), "\nR^2 =", round(JX39P_r_squared, 2)),
+           size = 3) +
+  theme_bw()+
+  labs(title = "Joint Scatter Plot of Expression Levels for JX39P: Normoxia vs. Hypoxia",
+       x = "Expression Level in Normoxia (JX39P)",
+       y = "Expression Level in Hypoxia (JX39P)")+
+  xlim(-5, 15) +  # Set x-axis limits
+  ylim(-5, 15)    # Set y-axis limits
+ggsave("JX39P_plot.png", width = 8, height = 6, units = "in")
+
+```
+
+## 4.vvVoom Limma Analysis to see under four different condition does H or N make a difference
+```{r}
+library(limma)
+library(edgeR)
+
+# Import and read in Data
+GBM_data <- "/Users/oceanuszhang/Library/CloudStorage/OneDrive-EmoryUniversity/MPH 1st Year/24Spring/GBM/GBM_Oceanus/GBM_DATA_OC/GBM_normalized.csv"
+GBM_norm_limma <- read.csv(GBM_data, row.names = 1) 
+
+# Change all 0 to 1 in the dataframe
+GBM_norm[GBM_norm == 0] <- 1
+
+sample_names <- colnames(GBM_norm)
+parsed_info <- strsplit(sample_names, "\\.")
+xenolines <- sapply(parsed_info, function(x) x[1])
+main_conditions <- sapply(parsed_info, function(x) x[2])
+sub_conditions <- sapply(parsed_info, function(x) x[3])
+
+# This approach simplifies assuming each sample has a unique combination of conditions
+combined_conditions <- paste(xenolines, main_conditions, sub_conditions, sep="_")
+conditions <- factor(combined_conditions)
+design <- model.matrix(~ 0 + conditions)
+colnames(design) <- levels(conditions)
+
+
+v <- voom(GBM_norm, design, plot=TRUE)
+fit <- lmFit(v, design)
+
+contrasts <- makeContrasts(
+  # Contrasts for xenoline JX39P across all conditions
+  JX39P_B_H_vs_N = JX39P_B_H - JX39P_B_N,
+  JX39P_G_H_vs_N = JX39P_G_H - JX39P_G_N,
+  JX39P_M_H_vs_N = JX39P_M_H - JX39P_M_N,
+  JX39P_N_H_vs_N = JX39P_N_H - JX39P_N_N,
+  
+  # Contrasts for xenoline X1441 across all conditions
+  X1441_B_H_vs_N = X1441_B_H - X1441_B_N,
+  X1441_G_H_vs_N = X1441_G_H - X1441_G_N,
+  X1441_M_H_vs_N = X1441_M_H - X1441_M_N,
+  X1441_N_H_vs_N = X1441_N_H - X1441_N_N,
+  
+  # Contrasts for xenoline XD456 across all conditions
+  XD456_B_H_vs_N = XD456_B_H - XD456_B_N,
+  XD456_G_H_vs_N = XD456_G_H - XD456_G_N,
+  XD456_M_H_vs_N = XD456_M_H - XD456_M_N,
+  XD456_N_H_vs_N = XD456_N_H - XD456_N_N,
+  
+  levels = design
+)
+
+fit2 <- contrasts.fit(fit, contrasts)
+fit2 <- eBayes(fit2)
+
+
+# Results for XD456 under condition B
+results_XD456_B <- topTable(fit2, coef="XD456_B_H_vs_N", adjust="BH", sort.by="B", number=Inf)
+results_XD456_N <- topTable(fit2, coef="XD456_N_H_vs_N", adjust="BH", sort.by="B", number=Inf)
+results_XD456_M <- topTable(fit2, coef="XD456_M_H_vs_N", adjust="BH", sort.by="B", number=Inf)
+results_XD456_G <- topTable(fit2, coef="XD456_G_H_vs_N", adjust="BH", sort.by="B", number=Inf)
+
+# Results for JX39P under condition B
+results_JX39P_B <- topTable(fit2, coef="JX39P_B_H_vs_N", adjust="BH", sort.by="B", number=Inf)
+results_JX39P_N <- topTable(fit2, coef="JX39P_N_H_vs_N", adjust="BH", sort.by="B", number=Inf)
+results_JX39P_M <- topTable(fit2, coef="JX39P_M_H_vs_N", adjust="BH", sort.by="B", number=Inf)
+results_JX39P_G <- topTable(fit2, coef="JX39P_G_H_vs_N", adjust="BH", sort.by="B", number=Inf)
+
+
+# Results for X1441 under condition B
+results_X1441_B <- topTable(fit2, coef="X1441_B_H_vs_N", adjust="BH", sort.by="B", number=Inf)
+results_X1441_N <- topTable(fit2, coef="X1441_N_H_vs_N", adjust="BH", sort.by="B", number=Inf)
+results_X1441_M <- topTable(fit2, coef="X1441_M_H_vs_N", adjust="BH", sort.by="B", number=Inf)
+results_X1441_G <- topTable(fit2, coef="X1441_G_H_vs_N", adjust="BH", sort.by="B", number=Inf)
+
+
+```
+
+## 5. Post Analysis 
+```{r}
+#Cut of FDR=0.05, 0.1, 0.15;  
+#Make a table – how many genes are significant under each condition;  
+# Histogram of -log10 transformed FDR values to enhance visibility of smaller FDRs
+fdr_threshold <- 0.05
+results <- topTable(fit2, adjust="BH", sort.by="B", number=Inf)
+hist(-log10(results$adj.P.Val), breaks = 100, main = "Histogram of -log10 Transformed FDR Values", xlab = "-log10(FDR)", col = "blue")
+
+# Counting significant genes at FDR < 0.05
+sig_genes_0.05 <-sum(results$adj.P.Val < 0.05, na.rm = TRUE)
+sig_genes_0.1 <-sum(results$adj.P.Val < 0.1, na.rm = TRUE)
+sig_genes_0.15 <-sum(results$adj.P.Val < 0.15, na.rm = TRUE)
+
+# Function to extract significant gene names based on a threshold
+extract_significant_genes <- function(fit_object, contrast_name, fdr_threshold = 0.05) {
+  results <- topTable(fit_object, coef=contrast_name, adjust="BH", number=Inf, sort.by="B")
+  sig_genes <- results[results$adj.P.Val < fdr_threshold, ]
+  return(data.frame(Gene_Name = rownames(sig_genes), AdjPVal = sig_genes$adj.P.Val))
+}
+
+# List of contrasts based on conditions
+contrasts <- c("JX39P_B_H_vs_N", "JX39P_M_H_vs_N", 
+               "X1441_B_H_vs_N", "X1441_G_H_vs_N", "X1441_M_H_vs_N", "X1441_N_H_vs_N",
+               "XD456_B_H_vs_N", "XD456_G_H_vs_N", "XD456_M_H_vs_N", "XD456_N_H_vs_N")
+
+# Optionally, if contrasts names directly map to condition names, you could simplify
+conditions <- gsub("_H_vs_N", "", contrasts)
+
+# Initialize a list to store significant genes data frames
+significant_genes_list <- list()
+
+for (contrast in contrasts) {
+  # Extract significant genes
+  sig_genes <- extract_significant_genes(fit2, contrast, 0.05)
+  
+  # Store in the list with a descriptive name
+  significant_genes_list[[contrast]] <- sig_genes
+}
+
+JX39P_B_Sig <- significant_genes_list[[1]]$Gene_Name
+JX39P_M_Sig <- significant_genes_list[[2]]$Gene_Name
+X1441_B_Sig <- significant_genes_list[[3]]$Gene_Name
+X1441_G_Sig <- significant_genes_list[[4]]$Gene_Name
+X1441_M_Sig <- significant_genes_list[[5]]$Gene_Name
+X1441_N_Sig <- significant_genes_list[[6]]$Gene_Name
+XD456_B_Sig <- significant_genes_list[[7]]$Gene_Name
+XD456_G_Sig <- significant_genes_list[[8]]$Gene_Name
+XD456_M_Sig <- significant_genes_list[[9]]$Gene_Name
+XD456_N_Sig <- significant_genes_list[[10]]$Gene_Name
+
+max_length <- max(sapply(significant_genes_list, nrow))
+# Initialize the data frame
+sig_genes_table <- data.frame(matrix(NA, nrow = max_length, ncol = 10))
+names(sig_genes_table) <- c("JX39P_B", "JX39P_M", "X1441_B", "X1441_G", "X1441_M", "X1441_N", "XD456_B", "XD456_G", "XD456_M", "XD456_N")
+
+# Fill in the table
+sig_genes_table$JX39P_B[seq_along(JX39P_B_Sig)] <- JX39P_B_Sig
+sig_genes_table$JX39P_M[seq_along(JX39P_M_Sig)] <- JX39P_M_Sig
+sig_genes_table$X1441_B[seq_along(X1441_B_Sig)] <- X1441_B_Sig
+sig_genes_table$X1441_G[seq_along(X1441_G_Sig)] <- X1441_G_Sig
+sig_genes_table$X1441_M[seq_along(X1441_M_Sig)] <- X1441_M_Sig
+sig_genes_table$X1441_N[seq_along(X1441_N_Sig)] <- X1441_N_Sig
+sig_genes_table$XD456_B[seq_along(XD456_B_Sig)] <- XD456_B_Sig
+sig_genes_table$XD456_G[seq_along(XD456_G_Sig)] <- XD456_G_Sig
+sig_genes_table$XD456_M[seq_along(XD456_M_Sig)] <- XD456_M_Sig
+sig_genes_table$XD456_N[seq_along(XD456_N_Sig)] <- XD456_N_Sig
+head(sig_genes_table)
+
+library(dplyr)
+library(tidyr)
+
+# Reshape the data frame from wide to long format
+sig_genes_long <- sig_genes_table %>%
+  mutate(RowID = row_number()) %>%
+  pivot_longer(cols = -RowID, names_to = "Condition", values_to = "Gene_Name") %>%
+  filter(!is.na(Gene_Name)) %>%
+  select(-RowID)  # Remove the RowID if not needed further
+
+# Find duplicate gene names (i.e., genes that appear in more than one condition)
+duplicate_genes <- sig_genes_long %>%
+  group_by(Gene_Name) %>%
+  filter(n_distinct(Condition) > 1) %>%
+  arrange(Gene_Name)
+
+genes_in_multiple_conditions <- duplicate_genes %>%
+  group_by(Gene_Name) %>%
+  summarise(Conditions = toString(unique(Condition)))
+
+print(genes_in_multiple_conditions)
+```
+
+## 6. Check FDR Reasonable or not
+```{r}
+p_values <- results$P.Value
+
+# Compute the negative log10 of the p-values, filtering out any p-values that are 0 to avoid -Inf
+neg_log_p_values <- -log10(p_values[p_values > 0])
+
+# Plotting the histogram
+hist(p_values, breaks = 100, main = "Histogram of P-values", xlab = "P-value", col = "dodgerblue")
+hist(neg_log_p_values, breaks = 100, main = "Histogram of -log10(P-values)", xlab = "-log10(P-value)", col = "dodgerblue")
+
+```
+
+## 7. Volcano Plots
+```{r}
+# JX39P_B
+logFC_JX39P_B <- results_JX39P_B$logFC
+adjPVal_logFC_JX39P_B <- results_JX39P_B$adj.P.Val
+xlims <- c(-10, 10)  
+ylims <- c(0, 20)  
+
+threshold_adjPVal <- -log10(0.05)  
+threshold_logFC <- 1      
+plot(logFC_JX39P_B, -log10(adjPVal_logFC_JX39P_B), pch=20, 
+     main="Volcano Plot for JX39P_B", xlab="Log Fold Change", ylab="-log10(Adjusted P-Value)",
+     xlim=xlims, ylim=ylims, col=ifelse(adjPVal_logFC_JX39P_B < 0.05 & abs(logFC_JX39P_B) > threshold_logFC, "red", "black"))
+
+         
+abline(h=threshold_adjPVal, col="blue", lty=2)
+abline(v=c(-threshold_logFC, threshold_logFC), col="blue", lty=2)
+
+
+# JX39P_M
+logFC_JX39P_M <- results_JX39P_M$logFC  
+adjPVal_logFC_JX39P_M <- results_JX39P_M$adj.P.Val  
+plot(logFC_JX39P_M, -log10(adjPVal_logFC_JX39P_M), pch=20, 
+     main="Volcano Plot for JX39P_M", xlab="Log Fold Change", ylab="-log10(Adjusted P-Value)",
+     xlim=xlims, ylim=ylims, col=ifelse(adjPVal_logFC_JX39P_M < 0.05 & abs(logFC_JX39P_M) > threshold_logFC, "red", "black"))
+
+threshold_adjPVal <- -log10(0.05)  
+threshold_logFC <- 1               
+abline(h=threshold_adjPVal, col="blue", lty=2)
+abline(v=c(-threshold_logFC, threshold_logFC), col="blue", lty=2)
+
+
+# X1441_B
+logFC_X1441_B <- results_X1441_B$logFC  
+adjPVal_logFC_X1441_B <- results_X1441_B$adj.P.Val  
+plot(logFC_X1441_B, -log10(adjPVal_logFC_X1441_B), pch=20, 
+     main="Volcano Plot for X1441_B", xlab="Log Fold Change", ylab="-log10(Adjusted P-Value)",
+     xlim=xlims, ylim=ylims, col=ifelse(adjPVal_logFC_X1441_B < 0.05 & abs(logFC_X1441_B) > threshold_logFC, "red", "black"))
+
+threshold_adjPVal <- -log10(0.05)  
+threshold_logFC <- 1               
+abline(h=threshold_adjPVal, col="blue", lty=2)
+abline(v=c(-threshold_logFC, threshold_logFC), col="blue", lty=2)
+
+# X1441_G
+logFC_X1441_G <- results_X1441_G$logFC  
+adjPVal_logFC_X1441_G <- results_X1441_G$adj.P.Val  
+plot(logFC_X1441_G, -log10(adjPVal_logFC_X1441_G), pch=20, 
+     main="Volcano Plot for X1441_G", xlab="Log Fold Change", ylab="-log10(Adjusted P-Value)",
+     xlim=xlims, ylim=ylims, col=ifelse(adjPVal_logFC_X1441_G < 0.05 & abs(logFC_X1441_G) > threshold_logFC, "red", "black"))
+
+threshold_adjPVal <- -log10(0.05)  
+threshold_logFC <- 1               
+abline(h=threshold_adjPVal, col="blue", lty=2)
+abline(v=c(-threshold_logFC, threshold_logFC), col="blue", lty=2)
+
+# X1441_M
+logFC_X1441_M <- results_X1441_M$logFC  
+adjPVal_logFC_X1441_M <- results_X1441_M$adj.P.Val  
+plot(logFC_X1441_M, -log10(adjPVal_logFC_X1441_M), pch=20, 
+     main="Volcano Plot for X1441_M", xlab="Log Fold Change", ylab="-log10(Adjusted P-Value)",
+     xlim=xlims, ylim=ylims, col=ifelse(adjPVal_logFC_X1441_M < 0.05 & abs(logFC_X1441_M) > threshold_logFC, "red", "black"))
+
+threshold_adjPVal <- -log10(0.05)  
+threshold_logFC <- 1               
+abline(h=threshold_adjPVal, col="blue", lty=2)
+abline(v=c(-threshold_logFC, threshold_logFC), col="blue", lty=2)
+
+# X1441_N
+logFC_X1441_N <- results_X1441_N$logFC  
+adjPVal_logFC_X1441_N <- results_X1441_N$adj.P.Val  
+plot(logFC_X1441_N, -log10(adjPVal_logFC_X1441_N), pch=20, 
+     main="Volcano Plot for X1441_N", xlab="Log Fold Change", ylab="-log10(Adjusted P-Value)",
+     xlim=xlims, ylim=ylims, col=ifelse(adjPVal_logFC_X1441_N < 0.05 & abs(logFC_X1441_N) > threshold_logFC, "red", "black"))
+
+threshold_adjPVal <- -log10(0.05)  
+threshold_logFC <- 1               
+abline(h=threshold_adjPVal, col="blue", lty=2)
+abline(v=c(-threshold_logFC, threshold_logFC), col="blue", lty=2)
+
+# XD456_B
+logFC_XD456_B <- results_XD456_B$logFC  
+adjPVal_logFC_XD456_B <- results_XD456_B$adj.P.Val  
+plot(logFC_XD456_B, -log10(adjPVal_logFC_XD456_B), pch=20, 
+     main="Volcano Plot for XD456_B", xlab="Log Fold Change", ylab="-log10(Adjusted P-Value)",
+     xlim=xlims, ylim=ylims, col=ifelse(adjPVal_logFC_XD456_B < 0.05 & abs(logFC_XD456_B) > threshold_logFC, "red", "black"))
+
+threshold_adjPVal <- -log10(0.05)  
+threshold_logFC <- 1               
+abline(h=threshold_adjPVal, col="blue", lty=2)
+abline(v=c(-threshold_logFC, threshold_logFC), col="blue", lty=2)
+
+# XD456_G
+logFC_XD456_G <- results_XD456_G$logFC  
+adjPVal_logFC_XD456_G <- results_XD456_G$adj.P.Val  
+plot(logFC_XD456_G, -log10(adjPVal_logFC_XD456_G), pch=20, 
+     main="Volcano Plot for XD456_G", xlab="Log Fold Change", ylab="-log10(Adjusted P-Value)",
+     xlim=xlims, ylim=ylims, col=ifelse(adjPVal_logFC_XD456_G < 0.05 & abs(logFC_XD456_G) > threshold_logFC, "red", "black"))
+
+threshold_adjPVal <- -log10(0.05)  
+threshold_logFC <- 1               
+abline(h=threshold_adjPVal, col="blue", lty=2)
+abline(v=c(-threshold_logFC, threshold_logFC), col="blue", lty=2)
+
+# XD456_M
+logFC_XD456_M <- results_XD456_M$logFC  
+adjPVal_logFC_XD456_M <- results_XD456_M$adj.P.Val  
+plot(logFC_XD456_M, -log10(adjPVal_logFC_XD456_M), pch=20, 
+     main="Volcano Plot for XD456_M", xlab="Log Fold Change", ylab="-log10(Adjusted P-Value)",
+     xlim=xlims, ylim=ylims, col=ifelse(adjPVal_logFC_XD456_M < 0.05 & abs(logFC_XD456_M) > threshold_logFC, "red", "black"))
+
+threshold_adjPVal <- -log10(0.05)  
+threshold_logFC <- 1               
+abline(h=threshold_adjPVal, col="blue", lty=2)
+abline(v=c(-threshold_logFC, threshold_logFC), col="blue", lty=2)
+
+# XD456_N
+logFC_XD456_N <- results_XD456_N$logFC  
+adjPVal_logFC_XD456_N <- results_XD456_N$adj.P.Val  
+plot(logFC_XD456_N, -log10(adjPVal_logFC_XD456_N), pch=20, 
+     main="Volcano Plot for XD456_N", xlab="Log Fold Change", ylab="-log10(Adjusted P-Value)",
+     xlim=xlims, ylim=ylims, col=ifelse(adjPVal_logFC_XD456_N < 0.05 & abs(logFC_XD456_N) > threshold_logFC, "red", "black"))
+
+threshold_adjPVal <- -log10(0.05)  
+threshold_logFC <- 1               
+abline(h=threshold_adjPVal, col="blue", lty=2)
+abline(v=c(-threshold_logFC, threshold_logFC), col="blue", lty=2)
+```
+
+## 8. Plot clustering Heatmap
+```{r}
+numeric_data <- mean_values_df[, -which(names(mean_values_df) == "Gene_Name")]
+cor_matrix <- cor(numeric_data)
+hc_samples <- hclust(as.dist(1 - cor_matrix))  
+
+if (!requireNamespace("pheatmap", quietly = TRUE)) {
+    install.packages("pheatmap")
+}
+
+library(pheatmap)
+
+pheatmap(cor_matrix,
+         clustering_distance_rows = as.dist(1 - cor_matrix),
+         clustering_distance_cols = as.dist(1 - cor_matrix),
+         clustering_method = "complete",
+         color = colorRampPalette(c("blue", "white", "red"))(50),
+         main = "Correlation Heatmap",
+         treeheight_row = 50,
+         treeheight_col = 50,
+         fontsize_row = 8,   
+         fontsize_col = 8,  
+         angle_col = 45)    
+
+```
+
+## 9. FC Table
+```{r}
+# jx39p
+gene_names <- rownames(results_JX39P_B)
+fc_values <- results_JX39P_B[,"logFC"]  
+FC_JX39P_B <- data.frame(Gene = gene_names, FC = fc_values)
+
+gene_names <- rownames(results_JX39P_G)
+fc_values <- results_JX39P_G[,"logFC"]  
+FC_JX39P_G <- data.frame(Gene = gene_names, FC = fc_values)
+
+gene_names <- rownames(results_JX39P_M)
+fc_values <- results_JX39P_M[,"logFC"]  
+FC_JX39P_M <- data.frame(Gene = gene_names, FC = fc_values)
+
+gene_names <- rownames(results_JX39P_N)
+fc_values <- results_JX39P_N[,"logFC"]  
+FC_JX39P_N <- data.frame(Gene = gene_names, FC = fc_values)
+
+
+#X1441
+gene_names <- rownames(results_X1441_B)
+fc_values <- results_X1441_B[,"logFC"]  
+FC_X1441_B <- data.frame(Gene = gene_names, FC = fc_values)
+
+gene_names <- rownames(results_X1441_G)
+fc_values <- results_X1441_G[,"logFC"]  
+FC_X1441_G <- data.frame(Gene = gene_names, FC = fc_values)
+
+gene_names <- rownames(results_X1441_M)
+fc_values <- results_X1441_M[,"logFC"]  
+FC_X1441_M <- data.frame(Gene = gene_names, FC = fc_values)
+
+gene_names <- rownames(results_X1441_N)
+fc_values <- results_X1441_N[,"logFC"]  
+FC_X1441_N <- data.frame(Gene = gene_names, FC = fc_values)
+
+#xd456
+gene_names <- rownames(results_XD456_B)
+fc_values <- results_XD456_B[,"logFC"]  
+FC_XD456_B <- data.frame(Gene = gene_names, FC = fc_values)
+
+gene_names <- rownames(results_XD456_G)
+fc_values <- results_XD456_G[,"logFC"]  
+FC_XD456_G <- data.frame(Gene = gene_names, FC = fc_values)
+
+gene_names <- rownames(results_XD456_M)
+fc_values <- results_XD456_M[,"logFC"]  
+FC_XD456_M <- data.frame(Gene = gene_names, FC = fc_values)
+
+gene_names <- rownames(results_XD456_N)
+fc_values <- results_XD456_N[,"logFC"]  
+FC_XD456_N <- data.frame(Gene = gene_names, FC = fc_values)
+
+# List of all FC data frames created
+fc_data_frames <- list(FC_JX39P_B, FC_JX39P_G, FC_JX39P_M, FC_JX39P_N,
+                       FC_X1441_B, FC_X1441_G, FC_X1441_M, FC_X1441_N,
+                       FC_XD456_B, FC_XD456_G, FC_XD456_M, FC_XD456_N)
+
+# Merge all FC tables on the Gene column
+combined_FC <- Reduce(function(x, y) merge(x, y, by = "Gene", all = TRUE), fc_data_frames)
+
+names(combined_FC)[-1] <- c("FC_JX39P_B", "FC_JX39P_G", "FC_JX39P_M", "FC_JX39P_N",
+                            "FC_X1441_B", "FC_X1441_G", "FC_X1441_M", "FC_X1441_N",
+                            "FC_XD456_B", "FC_XD456_G", "FC_XD456_M", "FC_XD456_N")
+
+
+conditions <- colnames(combined_FC)[-1]
+num_conditions <- length(conditions)
+
+# Initialize matrices to hold the counts of significant comparisons
+upregulated_counts <- matrix(0, nrow = num_conditions, ncol = num_conditions, dimnames = list(conditions, conditions))
+for (i in 1:num_conditions) {
+    for (j in 1:num_conditions) {
+        if (i != j) {
+            fc_diffs <- combined_FC[[conditions[i]]] - combined_FC[[conditions[j]]]
+            upregulated_counts[i, j] <- sum(fc_diffs > log2(2), na.rm = TRUE)
+        }
+    }
+}
+
+downregulated_counts <- matrix(0, nrow = num_conditions, ncol = num_conditions, dimnames = list(conditions, conditions))
+for (i in 1:num_conditions) {
+    for (j in 1:num_conditions) {
+        if (i != j) {
+            fc_diffs <- combined_FC[[conditions[i]]] - combined_FC[[conditions[j]]]
+           downregulated_counts[i, j] <- sum(fc_diffs < -log2(2), na.rm = TRUE)
+        }
+    }
+}
+```
+
+## 10. Limma to compare BIOPRINT & MICROTUMOR
+```{r}
+library(limma)
+library(edgeR)
+
+sample_names <- colnames(GBM_norm)
+parsed_info <- strsplit(sample_names, "\\.")
+xenolines <- sapply(parsed_info, function(x) x[1])
+main_conditions <- sapply(parsed_info, function(x) x[2])
+sub_conditions <- sapply(parsed_info, function(x) x[3])
+
+combined_conditions <- paste(xenolines, main_conditions, sub_conditions, sep="_")
+conditions <- factor(combined_conditions)
+design <- model.matrix(~ 0 + conditions)
+colnames(design) <- levels(conditions)
+
+v <- voom(GBM_norm, design, plot=TRUE)
+fit <- lmFit(v, design)
+
+# Define contrasts for comparing Bioprint and Microtumor models under Normoxia and Hypoxia
+contrasts <- makeContrasts(
+  # Comparisons between Bioprint and Microtumor under Normoxia
+  Bioprint_vs_Microtumor_N = (JX39P_B_N + X1441_B_N + XD456_B_N + JX39P_G_N + X1441_G_N + XD456_G_N + JX39P_N_N + X1441_N_N + XD456_N_N) / 3 - (JX39P_M_N + X1441_M_N + XD456_M_N),
+  # Comparisons between Bioprint and Microtumor under Hypoxia
+  Bioprint_vs_Microtumor_H = (JX39P_B_H + X1441_B_H + XD456_B_H + JX39P_G_H + X1441_G_H + XD456_G_H + JX39P_N_H + X1441_N_H + XD456_N_H) / 3 - (JX39P_M_H + X1441_M_H + XD456_M_H),
+  
+  levels = design
+)
+
+fit2 <- contrasts.fit(fit, contrasts)
+fit2 <- eBayes(fit2)
+
+# Results for Bioprint vs. Microtumor under Normoxia
+results_B_vs_M_N <- topTable(fit2, coef="Bioprint_vs_Microtumor_N", adjust="BH", sort.by="B", number=Inf)
+# Results for Bioprint vs. Microtumor under Hypoxia
+results_B_vs_M_H <- topTable(fit2, coef="Bioprint_vs_Microtumor_H", adjust="BH", sort.by="B", number=Inf)
+
+
+# Extract rows where adj.P.Val < 0.05
+sig_BM_N <- subset(results_B_vs_M_N, adj.P.Val < 0.05)
+sig_BM_H <- subset(results_B_vs_M_H, adj.P.Val < 0.05)
+
+# Extract gene names & find overlap
+genes_sig_BM_N <- rownames(sig_BM_N)
+genes_sig_BM_H <- rownames(sig_BM_H)
+BM_overlap_genes <- intersect(genes_sig_BM_N, genes_sig_BM_H)
+print(BM_overlap_genes)
+
+```
+## Volcano Bioprint VS Microtumor
+```{r}
+xlims <- c(-30, 30)  
+ylims <- c(0, 40)  
+
+# Volcano plot for Bioprint vs. Microtumor under Normoxia
+logFC_B_vs_M_N <- results_B_vs_M_N$logFC  
+adjPVal_logFC_B_vs_M_N <- results_B_vs_M_N$adj.P.Val  
+plot(logFC_B_vs_M_N, -log10(adjPVal_logFC_B_vs_M_N), pch=20, 
+     main="Volcano Plot for Bioprint vs. Microtumor (Normoxia)", 
+     xlab="Log Fold Change", ylab="-log10(Adjusted P-Value)",
+     xlim=xlims, ylim=ylims, col=ifelse(adjPVal_logFC_B_vs_M_N < 0.05, "red", "black"))
+
+abline(h=-log10(0.05), col="blue", lty=2)
+abline(v=c(-1, 1), col="blue", lty=2)
+
+# Volcano plot for Bioprint vs. Microtumor under Hypoxia
+logFC_B_vs_M_H <- results_B_vs_M_H$logFC  
+adjPVal_logFC_B_vs_M_H <- results_B_vs_M_H$adj.P.Val  
+plot(logFC_B_vs_M_H, -log10(adjPVal_logFC_B_vs_M_H), pch=20, 
+     main="Volcano Plot for Bioprint vs. Microtumor (Hypoxia)", 
+     xlab="Log Fold Change", ylab="-log10(Adjusted P-Value)",
+     xlim=xlims, ylim=ylims, col=ifelse(adjPVal_logFC_B_vs_M_H < 0.05, "red", "black"))
+
+abline(h=-log10(0.05), col="blue", lty=2)
+abline(v=c(-1, 1), col="blue", lty=2)
+
+```
+## 11. Overall limma analysis - significance table
+```{r}
+# Create an empty data frame with genes as rows and conditions as columns
+gene_condition_table <- data.frame(Gene = unique(unlist(lapply(significant_genes_list, `[[`, "Gene_Name"))))
+
+# Print the number of unique genes
+print(paste("Number of unique genes:", nrow(gene_condition_table)))
+
+# Iterate over each condition and populate the table
+for (condition in names(significant_genes_list)) {
+  # Check if the condition is significant for each gene
+  condition_genes <- significant_genes_list[[condition]]$Gene_Name
+  gene_condition_table[[condition]] <- ifelse(gene_condition_table$Gene %in% condition_genes, 1, 0)
+}
+
+# Print the resulting data frame
+print(gene_condition_table)
+
+```
+
+## 12. Joint Scatter Plot of Bioprint VS Microtumor
+```{r}
+library(ggplot2)
+library(dplyr)
+
+#xd456
+# Define a function to generate and save scatter plots for comparisons
+generate_comparison_plot <- function(condition) {
+  # Filter data for Bioprint and Microtumor models under the specified condition
+  data_B <- filter(data_XD456, Condition == "Bioprint", Sub_Condition == condition)
+  data_M <- filter(data_XD456, Condition == "Microtumor", Sub_Condition == condition)
+  
+  # Merge the data based on Gene_Name
+  data_aligned <- merge(data_B, data_M, by = "Gene_Name", suffixes = c("_B", "_M"))
+  
+  # Plot
+  p <- ggplot(data_aligned, aes(x = Expression_Level_B, y = Expression_Level_M)) +
+    geom_point(shape = 21, color = "black", fill = "blue", size = 1, stroke = 0.5) +
+    geom_smooth(method = "lm", se = FALSE, color = "red") +
+    labs(title = paste("XD456 Bioprint vs. Microtumor:", condition),
+         x = paste("Expression Level - Bioprint", condition),
+         y = paste("Expression Level - Microtumor", condition)) +
+    theme_minimal()
+  # Display the plot in the R environment
+  print(p)
+  
+  # Save the plot to a file
+  plot_file_name <- paste("XD456_B_vs_M", condition, "plot.png", sep = "_")
+  ggsave(plot_file_name, plot = p, width = 8, height = 6, units = "in")
+}
+
+# Generate and save plots for both conditions
+generate_comparison_plot("Normoxia")
+generate_comparison_plot("Hypoxia")
+
+#x1441
+# Define a function to generate and save scatter plots for comparisons
+generate_comparison_plot <- function(condition) {
+  # Filter data for Bioprint and Microtumor models under the specified condition
+  data_B <- filter(data_X1441, Condition == "Bioprint", Sub_Condition == condition)
+  data_M <- filter(data_X1441, Condition == "Microtumor", Sub_Condition == condition)
+  
+  # Merge the data based on Gene_Name
+  data_aligned <- merge(data_B, data_M, by = "Gene_Name", suffixes = c("_B", "_M"))
+  
+  # Plot
+  p <- ggplot(data_aligned, aes(x = Expression_Level_B, y = Expression_Level_M)) +
+    geom_point(shape = 21, color = "black", fill = "blue", size = 1, stroke = 0.5) +
+    geom_smooth(method = "lm", se = FALSE, color = "red") +
+    labs(title = paste("X1441 Bioprint vs. Microtumor:", condition),
+         x = paste("Expression Level - Bioprint", condition),
+         y = paste("Expression Level - Microtumor", condition)) +
+    theme_minimal()
+  
+  # Display the plot in the R environment
+  print(p)
+  
+  # Save the plot to a file
+  plot_file_name <- paste("X1441_B_vs_M", condition, "plot.png", sep = "_")
+  ggsave(plot_file_name, plot = p, width = 8, height = 6, units = "in")
+}
+
+# Generate and save plots for both conditions
+generate_comparison_plot("Normoxia")
+generate_comparison_plot("Hypoxia")
+
+
+
+# Define a function to generate and save scatter plots for comparisons
+generate_comparison_plot <- function(condition) {
+  # Filter data for Bioprint and Microtumor models under the specified condition
+  data_B <- filter(data_JX39P, Condition == "Bioprint", Sub_Condition == condition)
+  data_M <- filter(data_JX39P, Condition == "Microtumor", Sub_Condition == condition)
+  
+  # Merge the data based on Gene_Name
+  data_aligned <- merge(data_B, data_M, by = "Gene_Name", suffixes = c("_B", "_M"))
+  
+  # Plot
+  p <- ggplot(data_aligned, aes(x = Expression_Level_B, y = Expression_Level_M)) +
+    geom_point(shape = 21, color = "black", fill = "blue", size = 1, stroke = 0.5) +
+    geom_smooth(method = "lm", se = FALSE, color = "red") +
+    labs(title = paste("data_JX39P Bioprint vs. Microtumor:", condition),
+         x = paste("Expression Level - Bioprint", condition),
+         y = paste("Expression Level - Microtumor", condition)) +
+    theme_minimal()
+  
+  # Display the plot in the R environment
+  print(p)
+  
+  # Save the plot to a file
+  plot_file_name <- paste("data_JX39P_B_vs_M", condition, "plot.png", sep = "_")
+  ggsave(plot_file_name, plot = p, width = 8, height = 6, units = "in")
+}
+
+# Generate and save plots for both conditions
+generate_comparison_plot("Normoxia")
+generate_comparison_plot("Hypoxia")
+
+```
+
+## density cloud scatter
+```{r}
+library(ggplot2)
+library(dplyr)
+
+#xd456
+# Define a function to generate and save scatter plots for comparisons
+generate_comparison_plot <- function(condition) {
+  # Filter data for Bioprint and Microtumor models under the specified condition
+  data_B <- filter(data_XD456, Condition == "Bioprint", Sub_Condition == condition)
+  data_M <- filter(data_XD456, Condition == "Microtumor", Sub_Condition == condition)
+  
+  # Merge the data based on Gene_Name
+  data_aligned <- merge(data_B, data_M, by = "Gene_Name", suffixes = c("_B", "_M"))
+  
+  # Plot
+  p <- ggplot(data_aligned, aes(x = Expression_Level_B, y = Expression_Level_M)) +
+    geom_point(shape = 21, color = "black", fill = "blue", size = 1, stroke = 0.5) +
+    geom_smooth(method = "lm", se = FALSE, color = "red") +
+    labs(title = paste("XD456 Bioprint vs. Microtumor:", condition),
+         x = paste("Expression Level - Bioprint", condition),
+         y = paste("Expression Level - Microtumor", condition)) +
+    geom_pointdensity() +
+  scale_color_viridis() +
+    theme_minimal()
+  # Display the plot in the R environment
+  print(p)
+  
+  # Save the plot to a file
+  plot_file_name <- paste("XD456_B_vs_M", condition, "plot.png", sep = "_")
+  ggsave(plot_file_name, plot = p, width = 8, height = 6, units = "in")
+}
+
+# Generate and save plots for both conditions
+generate_comparison_plot("Normoxia")
+generate_comparison_plot("Hypoxia")
+
+#x1441
+# Define a function to generate and save scatter plots for comparisons
+generate_comparison_plot <- function(condition) {
+  # Filter data for Bioprint and Microtumor models under the specified condition
+  data_B <- filter(data_X1441, Condition == "Bioprint", Sub_Condition == condition)
+  data_M <- filter(data_X1441, Condition == "Microtumor", Sub_Condition == condition)
+  
+  # Merge the data based on Gene_Name
+  data_aligned <- merge(data_B, data_M, by = "Gene_Name", suffixes = c("_B", "_M"))
+  
+  # Plot
+  p <- ggplot(data_aligned, aes(x = Expression_Level_B, y = Expression_Level_M)) +
+    geom_point(shape = 21, color = "black", fill = "blue", size = 1, stroke = 0.5) +
+    geom_smooth(method = "lm", se = FALSE, color = "red") +
+    labs(title = paste("X1441 Bioprint vs. Microtumor:", condition),
+         x = paste("Expression Level - Bioprint", condition),
+         y = paste("Expression Level - Microtumor", condition)) +
+    geom_pointdensity() +
+  scale_color_viridis() +
+    theme_minimal()
+  
+  # Display the plot in the R environment
+  print(p)
+  
+  # Save the plot to a file
+  plot_file_name <- paste("X1441_B_vs_M", condition, "plot.png", sep = "_")
+  ggsave(plot_file_name, plot = p, width = 8, height = 6, units = "in")
+}
+
+# Generate and save plots for both conditions
+generate_comparison_plot("Normoxia")
+generate_comparison_plot("Hypoxia")
+
+
+
+# Define a function to generate and save scatter plots for comparisons
+generate_comparison_plot <- function(condition) {
+  # Filter data for Bioprint and Microtumor models under the specified condition
+  data_B <- filter(data_JX39P, Condition == "Bioprint", Sub_Condition == condition)
+  data_M <- filter(data_JX39P, Condition == "Microtumor", Sub_Condition == condition)
+  
+  # Merge the data based on Gene_Name
+  data_aligned <- merge(data_B, data_M, by = "Gene_Name", suffixes = c("_B", "_M"))
+  
+  # Plot
+  p <- ggplot(data_aligned, aes(x = Expression_Level_B, y = Expression_Level_M)) +
+    geom_point(shape = 21, color = "black", fill = "blue", size = 1, stroke = 0.5) +
+    geom_smooth(method = "lm", se = FALSE, color = "red") +
+    labs(title = paste("data_JX39P Bioprint vs. Microtumor:", condition),
+         x = paste("Expression Level - Bioprint", condition),
+         y = paste("Expression Level - Microtumor", condition)) +
+    geom_pointdensity() +
+  scale_color_viridis() +
+    theme_minimal()
+  
+  # Display the plot in the R environment
+  print(p)
+  
+  # Save the plot to a file
+  plot_file_name <- paste("data_JX39P_B_vs_M", condition, "plot.png", sep = "_")
+  ggsave(plot_file_name, plot = p, width = 8, height = 6, units = "in")
+}
+
+# Generate and save plots for both conditions
+generate_comparison_plot("Normoxia")
+generate_comparison_plot("Hypoxia")
+
+```
+
+## 13. Bioprint VS Microtumor Seperate Limma Analysis(6 in total)
+```{r}
+library(limma)
+library(edgeR)
+
+parsed_info <- strsplit(sample_names, "\\.")
+xenolines <- sapply(parsed_info, function(x) x[1])
+main_conditions <- sapply(parsed_info, function(x) x[2])
+sub_conditions <- sapply(parsed_info, function(x) x[3])
+
+combined_conditions <- paste(xenolines, main_conditions, sub_conditions, sep="_")
+conditions <- factor(combined_conditions)
+design <- model.matrix(~ 0 + conditions)
+colnames(design) <- levels(conditions)
+
+v <- voom(GBM_norm, design, plot=TRUE)
+fit <- lmFit(v, design)
+
+# Define contrasts for each xenoline comparing Bioprint and Microtumor under both Normoxia and Hypoxia
+contrasts <- makeContrasts(
+  # XD456
+  Bioprint_vs_Microtumor_N_XD456 = XD456_B_N - XD456_M_N,
+  Bioprint_vs_Microtumor_H_XD456 = XD456_B_H - XD456_M_H,
+  
+  # X1441
+  Bioprint_vs_Microtumor_N_X1441 = X1441_B_N - X1441_M_N,
+  Bioprint_vs_Microtumor_H_X1441 = X1441_B_H - X1441_M_H,
+  
+  # JX39P
+  Bioprint_vs_Microtumor_N_JX39P = JX39P_B_N - JX39P_M_N,
+  Bioprint_vs_Microtumor_H_JX39P = JX39P_B_H - JX39P_M_H,
+  
+  levels = design
+)
+
+fit2 <- contrasts.fit(fit, contrasts)
+fit2 <- eBayes(fit2)
+
+# Initialize a list to store the number of significant genes
+sig_gene_counts <- list()
+
+for (xeno in c("XD456", "X1441", "JX39P")) {
+  for (cond in c("N", "H")) {
+    coef_name <- paste("Bioprint_vs_Microtumor", cond, xeno, sep="_")
+    results <- topTable(fit2, coef=coef_name, adjust="BH", sort.by="B", number=Inf)
+    
+    # Extract rows where adj.P.Val < 0.05
+    sig_results <- subset(results, adj.P.Val < 0.05)
+    num_sig_genes <- nrow(sig_results)
+    
+    # Store the number of significant genes in the list with a descriptive key
+    sig_gene_counts[[coef_name]] <- num_sig_genes
+  }
+}
+
+# Print the number of significant genes for each comparison
+print(sig_gene_counts)
+```
+## Volcano for separate BIOPRINT VS MICROTUMOR
+```{r}
+
+# Load necessary libraries
+library(limma)
+library(edgeR)
+
+# Parse the sample names into separate components
+parsed_info <- strsplit(sample_names, "\\.")
+xenolines <- sapply(parsed_info, function(x) x[1])
+main_conditions <- sapply(parsed_info, function(x) x[2])
+sub_conditions <- sapply(parsed_info, function(x) x[3])
+
+# Create combined condition labels
+combined_conditions <- paste(xenolines, main_conditions, sub_conditions, sep="_")
+conditions <- factor(combined_conditions)
+
+# Create a design matrix for the experiment
+design <- model.matrix(~ 0 + conditions)
+colnames(design) <- levels(conditions)
+
+# Normalize data and fit the linear model
+v <- voom(GBM_norm, design, plot=TRUE)
+fit <- lmFit(v, design)
+
+# Define contrasts for each xenoline comparing Bioprint vs Microtumor under both Normoxia and Hypoxia
+contrasts <- makeContrasts(
+  # XD456 contrasts
+  Bioprint_vs_Microtumor_N_XD456 = XD456_B_N - XD456_M_N,
+  Bioprint_vs_Microtumor_H_XD456 = XD456_B_H - XD456_M_H,
+
+  # X1441 contrasts
+  Bioprint_vs_Microtumor_N_X1441 = X1441_B_N - X1441_M_N,
+  Bioprint_vs_Microtumor_H_X1441 = X1441_B_H - X1441_M_H,
+
+  # JX39P contrasts
+  Bioprint_vs_Microtumor_N_JX39P = JX39P_B_N - JX39P_M_N,
+  Bioprint_vs_Microtumor_H_JX39P = JX39P_B_H - JX39P_M_H,
+
+  levels = design
+)
+
+# Apply the contrasts and compute eBayes
+fit2 <- contrasts.fit(fit, contrasts)
+fit2 <- eBayes(fit2)
+
+# Initialize an empty list to store results
+results_list <- list()
+
+# Define the list of contrast names
+contrast_names <- c(
+  "Bioprint_vs_Microtumor_N_XD456",
+  "Bioprint_vs_Microtumor_H_XD456",
+  "Bioprint_vs_Microtumor_N_X1441",
+  "Bioprint_vs_Microtumor_H_X1441",
+  "Bioprint_vs_Microtumor_N_JX39P",
+  "Bioprint_vs_Microtumor_H_JX39P"
+)
+
+# Extract and store results for each contrast
+for (contrast_name in contrast_names) {
+  results <- topTable(fit2, coef=contrast_name, adjust="BH", sort.by="B", number=Inf)
+  results_list[[contrast_name]] <- results
+}
+
+# Create a function to plot volcano plots with consistent axis limits
+create_volcano_plot <- function(results, title, xlims, ylims) {
+  significant <- results$adj.P.Val < 0.05
+  plot(
+    results$logFC, -log10(results$adj.P.Val), pch=20,
+    main=paste("Volcano Plot for", title),
+    xlab="Log Fold Change", ylab="-log10(Adjusted P-Value)",
+    xlim=xlims, ylim=ylims,
+    col=ifelse(significant, "red", "black")
+  )
+  abline(h=-log10(0.05), col="blue", lty=2)
+  abline(v=c(-1, 1), col="blue", lty=2)
+}
+
+# Create volcano plots for each contrast using consistent axis limits
+for (contrast_name in contrast_names) {
+  create_volcano_plot(results_list[[contrast_name]], contrast_name, xlims, ylims)
+}
+
+# Print the number of significant genes for each comparison
+sig_gene_counts <- sapply(results_list, function(x) sum(x$adj.P.Val < 0.05))
+print(sig_gene_counts)
+```
+## 14. Limma analysis of Neurosphere VS Geltrex
+```{r}
+library(limma)
+library(edgeR)
+
+parsed_info <- strsplit(sample_names, "\\.")
+xenolines <- sapply(parsed_info, function(x) x[1])
+main_conditions <- sapply(parsed_info, function(x) x[2])
+sub_conditions <- sapply(parsed_info, function(x) x[3])
+
+combined_conditions <- paste(xenolines, main_conditions, sub_conditions, sep="_")
+conditions <- factor(combined_conditions)
+design <- model.matrix(~ 0 + conditions)
+colnames(design) <- levels(conditions)
+
+v <- voom(GBM_norm, design, plot=TRUE)
+fit <- lmFit(v, design)
+
+# Define contrasts for each xenoline comparing Neurosphere VS Geltrex under both Normoxia and Hypoxia
+contrasts <- makeContrasts(
+  # XD456
+  Neurosphere_vs_Geltrex_N_XD456 = XD456_N_N - XD456_G_N,
+  Neurosphere_vs_Geltrex_H_XD456 = XD456_N_H - XD456_G_H,
+  
+  # X1441
+  Neurosphere_vs_Geltrex_N_X1441 = X1441_N_N - X1441_G_N,
+  Neurosphere_vs_Geltrex_H_X1441 = X1441_N_H - X1441_G_H,
+  
+  # JX39P
+  Neurosphere_vs_Geltrex_N_JX39P = JX39P_N_N - JX39P_G_N,
+  Neurosphere_vs_Geltrex_H_JX39P = JX39P_N_H - JX39P_G_H,
+  
+  levels = design
+)
+
+fit2 <- contrasts.fit(fit, contrasts)
+fit2 <- eBayes(fit2)
+
+# Initialize a list to store the number of significant genes
+sig_gene_counts <- list()
+
+for (xeno in c("XD456", "X1441", "JX39P")) {
+  for (cond in c("N", "H")) {
+    coef_name <- paste("Neurosphere_vs_Geltrex", cond, xeno, sep="_")
+    results <- topTable(fit2, coef=coef_name, adjust="BH", sort.by="B", number=Inf)
+    
+    # Extract rows where adj.P.Val < 0.05
+    sig_results <- subset(results, adj.P.Val < 0.05)
+    num_sig_genes <- nrow(sig_results)
+    
+    # Store the number of significant genes in the list with a descriptive key
+    sig_gene_counts[[coef_name]] <- num_sig_genes
+  }
+}
+
+# Print the number 
+print(sig_gene_counts)
+
+# Extract results for a specific contrast
+contrast_name <- "Neurosphere_vs_Geltrex_N_XD456"  # Example contrast name
+results <- topTable(fit2, coef=contrast_name, adjust="BH", sort.by="B", number=Inf)
+
+# Print the head of the results table
+print(head(results))
+
+```
+
+## Volcano N VS G
+```{r}
+# Define contrast names
+contrast_names <- c(
+  "Neurosphere_vs_Geltrex_N_XD456",
+  "Neurosphere_vs_Geltrex_H_XD456",
+  "Neurosphere_vs_Geltrex_N_X1441",
+  "Neurosphere_vs_Geltrex_H_X1441",
+  "Neurosphere_vs_Geltrex_N_JX39P",
+  "Neurosphere_vs_Geltrex_H_JX39P"
+)
+
+# Initialize variables for each contrast
+results_N_vs_G_N_XD456 <- NULL
+results_N_vs_G_H_XD456 <- NULL
+results_N_vs_G_N_X1441 <- NULL
+results_N_vs_G_H_X1441 <- NULL
+results_N_vs_G_N_JX39P <- NULL
+results_N_vs_G_H_JX39P <- NULL
+
+# Extract results for each contrast and assign to respective variables
+for (contrast_name in contrast_names) {
+  results <- topTable(fit2, coef = contrast_name, adjust = "BH", sort.by = "B", number = Inf)
+  
+  # Assign results to respective variables based on contrast name
+  if (grepl("_N_", contrast_name)) {
+    if (grepl("_XD456", contrast_name)) {
+      results_N_vs_G_N_XD456 <- results
+    } else if (grepl("_X1441", contrast_name)) {
+      results_N_vs_G_N_X1441 <- results
+    } else if (grepl("_JX39P", contrast_name)) {
+      results_N_vs_G_N_JX39P <- results
+    }
+  } else if (grepl("_H_", contrast_name)) {
+    if (grepl("_XD456", contrast_name)) {
+      results_N_vs_G_H_XD456 <- results
+    } else if (grepl("_X1441", contrast_name)) {
+      results_N_vs_G_H_X1441 <- results
+    } else if (grepl("_JX39P", contrast_name)) {
+      results_N_vs_G_H_JX39P <- results
+    }
+  }
+}
+
+# Define a function to create volcano plot
+create_volcano_plot <- function(logFC, adjPVal_logFC, title) {
+  plot(logFC, -log10(adjPVal_logFC), pch=20, 
+       main=paste("Volcano Plot for", title), 
+       xlab="Log Fold Change", ylab="-log10(Adjusted P-Value)",
+       xlim=xlims, ylim=ylims,  # Custom limits for x-axis and y-axis
+       col=ifelse(adjPVal_logFC < 0.05, "red", "black"))
+  
+  abline(h=-log10(0.05), col="blue", lty=2)
+  abline(v=c(-1, 1), col="blue", lty=2)
+}
+
+# Custom limits for x-axis and y-axis
+xlims <- c(-10, 10)
+ylims <- c(0, 20)
+
+# Volcano plot for XD456 (Normoxia)
+create_volcano_plot(results_N_vs_G_N_XD456$logFC, results_N_vs_G_N_XD456$adj.P.Val, "Neurosphere vs. Geltrex (Normoxia) XD456")
+# Volcano plot for XD456 (Hypoxia)
+create_volcano_plot(results_N_vs_G_H_XD456$logFC, results_N_vs_G_H_XD456$adj.P.Val, "Neurosphere vs. Geltrex (Hypoxia) XD456")
+
+# Volcano plot for X1441 (Normoxia)
+create_volcano_plot(results_N_vs_G_N_X1441$logFC, results_N_vs_G_N_X1441$adj.P.Val, "Neurosphere vs. Geltrex (Normoxia) X1441")
+# Volcano plot for X1441 (Hypoxia)
+create_volcano_plot(results_N_vs_G_H_X1441$logFC, results_N_vs_G_H_X1441$adj.P.Val, "Neurosphere vs. Geltrex (Hypoxia) X1441")
+
+# Volcano plot for JX39P (Normoxia)
+create_volcano_plot(results_N_vs_G_N_JX39P$logFC, results_N_vs_G_N_JX39P$adj.P.Val, "Neurosphere vs. Geltrex (Normoxia) JX39P")
+# Volcano plot for JX39P (Hypoxia)
+create_volcano_plot(results_N_vs_G_H_JX39P$logFC, results_N_vs_G_H_JX39P$adj.P.Val, "Neurosphere vs. Geltrex (Hypoxia) JX39P")
+
+```
+
+## SCATTER of Neurosphere VS Geltrex 
+```{R}
+library(ggplot2)
+library(dplyr)
+
+#XD456
+# Define a function to generate and save scatter plots for comparisons
+generate_comparison_plot <- function(condition) {
+  # Filter data for Bioprint and Microtumor models under the specified condition
+  data_N <- filter(data_XD456, Condition == "Neurosphere", Sub_Condition == condition)
+  data_G <- filter(data_XD456, Condition == "Geltrex", Sub_Condition == condition)
+  
+  # Merge the data based on Gene_Name
+  data_aligned <- merge(data_N, data_G, by = "Gene_Name", suffixes = c("_N", "_G"))
+  
+  # Plot
+  p <- ggplot(data_aligned, aes(x = Expression_Level_N, y = Expression_Level_G)) +
+    geom_point(shape = 21, color = "black", fill = "blue", size = 1, stroke = 0.5) +
+    geom_smooth(method = "lm", se = FALSE, color = "red") +
+    labs(title = paste("XD456 Neurosphere vs. Geltrex:", condition),
+         x = paste("Expression Level - Neurosphere", condition),
+         y = paste("Expression Level - Geltrex", condition)) +
+    theme_minimal()
+
+  print(p)
+  
+  # Save the plot to a file
+  plot_file_name <- paste("XD456_N_vs_G", condition, "plot.png", sep = "_")
+  ggsave(plot_file_name, plot = p, width = 8, height = 6, units = "in")
+}
+
+# Generate and save plots for both conditions
+generate_comparison_plot("Normoxia")
+generate_comparison_plot("Hypoxia")
+
+#x1441
+# Define a function to generate and save scatter plots for comparisons
+generate_comparison_plot <- function(condition) {
+  # Filter data for Bioprint and Microtumor models under the specified condition
+  data_N <- filter(data_X1441, Condition == "Neurosphere", Sub_Condition == condition)
+  data_G <- filter(data_X1441, Condition == "Geltrex", Sub_Condition == condition)
+  
+  # Merge the data based on Gene_Name
+  data_aligned <- merge(data_N, data_G, by = "Gene_Name", suffixes = c("_N", "_G"))
+  
+  # Plot
+  p <- ggplot(data_aligned, aes(x = Expression_Level_N, y = Expression_Level_G)) +
+    geom_point(shape = 21, color = "black", fill = "blue", size = 1, stroke = 0.5) +
+    geom_smooth(method = "lm", se = FALSE, color = "red") +
+    labs(title = paste("X1441 Neurosphere vs. Geltrex:", condition),
+         x = paste("Expression Level - Neurosphere", condition),
+         y = paste("Expression Level - Geltrex", condition)) +
+    theme_minimal()
+
+  print(p)
+  
+  # Save the plot to a file
+  plot_file_name <- paste("X1441_N_vs_G", condition, "plot.png", sep = "_")
+  ggsave(plot_file_name, plot = p, width = 8, height = 6, units = "in")
+}
+
+# Generate and save plots for both conditions
+generate_comparison_plot("Normoxia")
+generate_comparison_plot("Hypoxia")
+
+
+# XJ39P
+# Define a function to generate and save scatter plots for comparisons
+generate_comparison_plot <- function(condition) {
+  # Filter data for Bioprint and Microtumor models under the specified condition
+  data_N <- filter(data_JX39P, Condition == "Neurosphere", Sub_Condition == condition)
+  data_G <- filter(data_JX39P, Condition == "Geltrex", Sub_Condition == condition)
+  
+  # Merge the data based on Gene_Name
+  data_aligned <- merge(data_N, data_G, by = "Gene_Name", suffixes = c("_N", "_G"))
+  
+  # Plot
+  p <- ggplot(data_aligned, aes(x = Expression_Level_N, y = Expression_Level_G)) +
+    geom_point(shape = 21, color = "black", fill = "blue", size = 1, stroke = 0.5) +
+    geom_smooth(method = "lm", se = FALSE, color = "red") +
+    labs(title = paste("data_JX39P Neurosphere vs. Geltrex:", condition),
+         x = paste("Expression Level - Neurospheret", condition),
+         y = paste("Expression Level - Geltrex", condition)) +
+    theme_minimal()
+  
+  # Display the plot in the R environment
+  print(p)
+  
+  # Save the plot to a file
+  plot_file_name <- paste("JX39P_N_vs_G", condition, "plot.png", sep = "_")
+  ggsave(plot_file_name, plot = p, width = 8, height = 6, units = "in")
+}
+
+# Generate and save plots for both conditions
+generate_comparison_plot("Normoxia")
+generate_comparison_plot("Hypoxia")
+```
+
+```{r}
+library(ggplot2)
+library(dplyr)
+
+#XD456
+# Define a function to generate and save scatter plots for comparisons
+generate_comparison_plot <- function(condition) {
+  # Filter data for Bioprint and Microtumor models under the specified condition
+  data_N <- filter(data_XD456, Condition == "Neurosphere", Sub_Condition == condition)
+  data_G <- filter(data_XD456, Condition == "Geltrex", Sub_Condition == condition)
+  
+  # Merge the data based on Gene_Name
+  data_aligned <- merge(data_N, data_G, by = "Gene_Name", suffixes = c("_N", "_G"))
+  
+  # Plot
+  p <- ggplot(data_aligned, aes(x = Expression_Level_N, y = Expression_Level_G)) +
+    geom_point(shape = 21, color = "black", fill = "blue", size = 1, stroke = 0.5) +
+    geom_smooth(method = "lm", se = FALSE, color = "red") +
+    labs(title = paste("XD456 Neurosphere vs. Geltrex:", condition),
+         x = paste("Expression Level - Neurosphere", condition),
+         y = paste("Expression Level - Geltrex", condition)) +
+    geom_pointdensity() +
+  scale_color_viridis() +
+    theme_minimal()
+
+  print(p)
+  
+  # Save the plot to a file
+  plot_file_name <- paste("XD456_N_vs_G", condition, "plot.png", sep = "_")
+  ggsave(plot_file_name, plot = p, width = 8, height = 6, units = "in")
+}
+
+# Generate and save plots for both conditions
+generate_comparison_plot("Normoxia")
+generate_comparison_plot("Hypoxia")
+
+#x1441
+# Define a function to generate and save scatter plots for comparisons
+generate_comparison_plot <- function(condition) {
+  # Filter data for Bioprint and Microtumor models under the specified condition
+  data_N <- filter(data_X1441, Condition == "Neurosphere", Sub_Condition == condition)
+  data_G <- filter(data_X1441, Condition == "Geltrex", Sub_Condition == condition)
+  
+  # Merge the data based on Gene_Name
+  data_aligned <- merge(data_N, data_G, by = "Gene_Name", suffixes = c("_N", "_G"))
+  
+  # Plot
+  p <- ggplot(data_aligned, aes(x = Expression_Level_N, y = Expression_Level_G)) +
+    geom_point(shape = 21, color = "black", fill = "blue", size = 1, stroke = 0.5) +
+    geom_smooth(method = "lm", se = FALSE, color = "red") +
+    labs(title = paste("X1441 Neurosphere vs. Geltrex:", condition),
+         x = paste("Expression Level - Neurosphere", condition),
+         y = paste("Expression Level - Geltrex", condition)) +
+    geom_pointdensity() +
+  scale_color_viridis() +
+    theme_minimal()
+
+  print(p)
+  
+  # Save the plot to a file
+  plot_file_name <- paste("X1441_N_vs_G", condition, "plot.png", sep = "_")
+  ggsave(plot_file_name, plot = p, width = 8, height = 6, units = "in")
+}
+
+# Generate and save plots for both conditions
+generate_comparison_plot("Normoxia")
+generate_comparison_plot("Hypoxia")
+
+
+# XJ39P
+# Define a function to generate and save scatter plots for comparisons
+generate_comparison_plot <- function(condition) {
+  # Filter data for Bioprint and Microtumor models under the specified condition
+  data_N <- filter(data_JX39P, Condition == "Neurosphere", Sub_Condition == condition)
+  data_G <- filter(data_JX39P, Condition == "Geltrex", Sub_Condition == condition)
+  
+  # Merge the data based on Gene_Name
+  data_aligned <- merge(data_N, data_G, by = "Gene_Name", suffixes = c("_N", "_G"))
+  
+  # Plot
+  p <- ggplot(data_aligned, aes(x = Expression_Level_N, y = Expression_Level_G)) +
+    geom_point(shape = 21, color = "black", fill = "blue", size = 1, stroke = 0.5) +
+    geom_smooth(method = "lm", se = FALSE, color = "red") +
+    labs(title = paste("data_JX39P Neurosphere vs. Geltrex:", condition),
+         x = paste("Expression Level - Neurospheret", condition),
+         y = paste("Expression Level - Geltrex", condition)) +
+    geom_pointdensity() +
+  scale_color_viridis() +
+    theme_minimal()
+  
+  # Display the plot in the R environment
+  print(p)
+  
+  # Save the plot to a file
+  plot_file_name <- paste("JX39P_N_vs_G", condition, "plot.png", sep = "_")
+  ggsave(plot_file_name, plot = p, width = 8, height = 6, units = "in")
+}
+
+# Generate and save plots for both conditions
+generate_comparison_plot("Normoxia")
+generate_comparison_plot("Hypoxia")
+```
+
+## Geltrex exploration-XD456 4 Model comparison - Limma and Volcano
+```{r}
+# Extract sample information from column names
+sample_names <- colnames(GBM_norm)
+parsed_info <- strsplit(sample_names, "\\.")
+xenolines <- sapply(parsed_info, function(x) x[1])
+main_conditions <- sapply(parsed_info, function(x) x[2])
+sub_conditions <- sapply(parsed_info, function(x) x[3])
+
+# Combine sample information into a single factor variable
+combined_conditions <- paste(xenolines, main_conditions, sub_conditions, sep="_")
+conditions <- factor(combined_conditions)
+
+# Create design matrix
+design <- model.matrix(~ 0 + conditions)
+colnames(design) <- levels(conditions)
+
+# Perform voom transformation
+v <- voom(GBM_norm, design, plot=TRUE)
+
+# Fit linear model
+fit <- lmFit(v, design)
+
+# Define contrasts for comparisons
+contrasts <- makeContrasts(
+  # Contrast 1: Geltrex vs. Neurosphere
+  Geltrex_vs_Neurosphere_N = XD456_G_N - XD456_N_N,
+  Geltrex_vs_Neurosphere_H = XD456_G_H - XD456_N_H,
+  
+  # Contrast 2: Geltrex vs. Bioprint
+  Geltrex_vs_Bioprint_N = XD456_G_N - XD456_B_N,
+  Geltrex_vs_Bioprint_H = XD456_G_H - XD456_B_H,
+  
+  # Contrast 3: Geltrex vs. Microtumor
+  Geltrex_vs_Microtumor_N = XD456_G_N - XD456_M_N,
+  Geltrex_vs_Microtumor_H = XD456_G_H - XD456_M_H,
+  
+  levels = design
+)
+
+# Fit contrasts
+fit_contrasts <- contrasts.fit(fit, contrasts)
+fit_contrasts <- eBayes(fit_contrasts)
+
+# Extract results for each contrast
+results_Geltrex_vs_Neurosphere_N <- topTable(fit_contrasts, coef="Geltrex_vs_Neurosphere_N", number=Inf)
+results_Geltrex_vs_Neurosphere_H <- topTable(fit_contrasts, coef="Geltrex_vs_Neurosphere_H", number=Inf)
+results_Geltrex_vs_Bioprint_N <- topTable(fit_contrasts, coef="Geltrex_vs_Bioprint_N", number=Inf)
+results_Geltrex_vs_Bioprint_H <- topTable(fit_contrasts, coef="Geltrex_vs_Bioprint_H", number=Inf)
+results_Geltrex_vs_Microtumor_N <- topTable(fit_contrasts, coef="Geltrex_vs_Microtumor_N", number=Inf)
+results_Geltrex_vs_Microtumor_H <- topTable(fit_contrasts, coef="Geltrex_vs_Microtumor_H", number=Inf)
+
+# Define a function to create volcano plot
+create_volcano_plot <- function(logFC, adjPVal_logFC, title) {
+  plot(logFC, -log10(adjPVal_logFC), pch=20, 
+       main=paste("Volcano Plot for", title), 
+       xlab="Log Fold Change", ylab="-log10(Adjusted P-Value)",
+       xlim=xlims, ylim=ylims,  # Custom limits for x-axis and y-axis
+       col=ifelse(adjPVal_logFC < 0.05, "red", "black"))
+  
+  abline(h=-log10(0.05), col="blue", lty=2)
+  abline(v=c(-1, 1), col="blue", lty=2)
+}
+
+# Custom limits for x-axis and y-axis
+xlims <- c(-10, 10)
+ylims <- c(0, 20)
+
+# Volcano plot for Geltrex vs. Neurosphere (Normoxia)
+create_volcano_plot(results_Geltrex_vs_Neurosphere_N$logFC, results_Geltrex_vs_Neurosphere_N$adj.P.Val, "XD456 Geltrex vs. Neurosphere (Normoxia)")
+
+# Volcano plot for Geltrex vs. Neurosphere (Hypoxia)
+create_volcano_plot(results_Geltrex_vs_Neurosphere_H$logFC, results_Geltrex_vs_Neurosphere_H$adj.P.Val, "XD456 Geltrex vs. Neurosphere (Hypoxia)")
+
+# Volcano plot for Geltrex vs. Bioprint (Normoxia)
+create_volcano_plot(results_Geltrex_vs_Bioprint_N$logFC, results_Geltrex_vs_Bioprint_N$adj.P.Val, "XD456 Geltrex vs. Bioprint (Normoxia)")
+
+# Volcano plot for Geltrex vs. Bioprint (Hypoxia)
+create_volcano_plot(results_Geltrex_vs_Bioprint_H$logFC, results_Geltrex_vs_Bioprint_H$adj.P.Val, "XD456 Geltrex vs. Bioprint (Hypoxia)")
+
+# Volcano plot for Geltrex vs. Microtumor (Normoxia)
+create_volcano_plot(results_Geltrex_vs_Microtumor_N$logFC, results_Geltrex_vs_Microtumor_N$adj.P.Val, "XD456 Geltrex vs. Microtumor (Normoxia)")
+
+# Volcano plot for Geltrex vs. Microtumor (Hypoxia)
+create_volcano_plot(results_Geltrex_vs_Microtumor_H$logFC, results_Geltrex_vs_Microtumor_H$adj.P.Val, "XD456 Geltrex vs. Microtumor (Hypoxia)")
+```
+
+
+##  Geltrex exploration-X1441 4 Model comparison - Limma and Volcano
+```{r}
+
+# Define contrasts for comparisons
+contrasts <- makeContrasts(
+  # Contrast 1: Geltrex vs. Neurosphere
+  Geltrex_vs_Neurosphere_N = X1441_G_N - X1441_N_N,
+  Geltrex_vs_Neurosphere_H = X1441_G_H - X1441_N_H,
+  
+  # Contrast 2: Geltrex vs. Bioprint
+  Geltrex_vs_Bioprint_N = X1441_G_N - X1441_B_N,
+  Geltrex_vs_Bioprint_H = X1441_G_H - X1441_B_H,
+  
+  # Contrast 3: Geltrex vs. Microtumor
+  Geltrex_vs_Microtumor_N = X1441_G_N - X1441_M_N,
+  Geltrex_vs_Microtumor_H = X1441_G_H - X1441_M_H,
+  
+  levels = design
+)
+
+# Fit contrasts
+fit_contrasts <- contrasts.fit(fit, contrasts)
+fit_contrasts <- eBayes(fit_contrasts)
+
+# Extract results for each contrast
+results_Geltrex_vs_Neurosphere_N <- topTable(fit_contrasts, coef="Geltrex_vs_Neurosphere_N", number=Inf)
+results_Geltrex_vs_Neurosphere_H <- topTable(fit_contrasts, coef="Geltrex_vs_Neurosphere_H", number=Inf)
+results_Geltrex_vs_Bioprint_N <- topTable(fit_contrasts, coef="Geltrex_vs_Bioprint_N", number=Inf)
+results_Geltrex_vs_Bioprint_H <- topTable(fit_contrasts, coef="Geltrex_vs_Bioprint_H", number=Inf)
+results_Geltrex_vs_Microtumor_N <- topTable(fit_contrasts, coef="Geltrex_vs_Microtumor_N", number=Inf)
+results_Geltrex_vs_Microtumor_H <- topTable(fit_contrasts, coef="Geltrex_vs_Microtumor_H", number=Inf)
+
+# Define a function to create volcano plot
+create_volcano_plot <- function(logFC, adjPVal_logFC, title) {
+  plot(logFC, -log10(adjPVal_logFC), pch=20, 
+       main=paste("Volcano Plot for", title), 
+       xlab="Log Fold Change", ylab="-log10(Adjusted P-Value)",
+       xlim=xlims, ylim=ylims,  # Custom limits for x-axis and y-axis
+       col=ifelse(adjPVal_logFC < 0.05, "red", "black"))
+  
+  abline(h=-log10(0.05), col="blue", lty=2)
+  abline(v=c(-1, 1), col="blue", lty=2)
+}
+
+# Custom limits for x-axis and y-axis
+xlims <- c(-10, 10)
+ylims <- c(0, 20)
+
+# Volcano plot for Geltrex vs. Neurosphere (Normoxia)
+create_volcano_plot(results_Geltrex_vs_Neurosphere_N$logFC, results_Geltrex_vs_Neurosphere_N$adj.P.Val, "X1441 Geltrex vs. Neurosphere (Normoxia)")
+
+# Volcano plot for Geltrex vs. Neurosphere (Hypoxia)
+create_volcano_plot(results_Geltrex_vs_Neurosphere_H$logFC, results_Geltrex_vs_Neurosphere_H$adj.P.Val, "X1441 Geltrex vs. Neurosphere (Hypoxia)")
+
+# Volcano plot for Geltrex vs. Bioprint (Normoxia)
+create_volcano_plot(results_Geltrex_vs_Bioprint_N$logFC, results_Geltrex_vs_Bioprint_N$adj.P.Val, "X1441 Geltrex vs. Bioprint (Normoxia)")
+
+# Volcano plot for Geltrex vs. Bioprint (Hypoxia)
+create_volcano_plot(results_Geltrex_vs_Bioprint_H$logFC, results_Geltrex_vs_Bioprint_H$adj.P.Val, "X1441 Geltrex vs. Bioprint (Hypoxia)")
+
+# Volcano plot for Geltrex vs. Microtumor (Normoxia)
+create_volcano_plot(results_Geltrex_vs_Microtumor_N$logFC, results_Geltrex_vs_Microtumor_N$adj.P.Val, "X1441 Geltrex vs. Microtumor (Normoxia)")
+
+# Volcano plot for Geltrex vs. Microtumor (Hypoxia)
+create_volcano_plot(results_Geltrex_vs_Microtumor_H$logFC, results_Geltrex_vs_Microtumor_H$adj.P.Val, "X1441 Geltrex vs. Microtumor (Hypoxia)")
+```
+## Geltrex exploration-JX39P 4 Model comparison - Limma and Volcano
+```{r}
+# Define contrasts for comparisons
+contrasts <- makeContrasts(
+  # Contrast 1: Geltrex vs. Neurosphere
+  Geltrex_vs_Neurosphere_N = JX39P_G_N - JX39P_N_N,
+  Geltrex_vs_Neurosphere_H = JX39P_G_H - JX39P_N_H,
+  
+  # Contrast 2: Geltrex vs. Bioprint
+  Geltrex_vs_Bioprint_N = JX39P_G_N - JX39P_B_N,
+  Geltrex_vs_Bioprint_H = JX39P_G_H - JX39P_B_H,
+  
+  # Contrast 3: Geltrex vs. Microtumor
+  Geltrex_vs_Microtumor_N = JX39P_G_N - JX39P_M_N,
+  Geltrex_vs_Microtumor_H = JX39P_G_H - JX39P_M_H,
+  
+  levels = design
+)
+
+# Fit contrasts
+fit_contrasts <- contrasts.fit(fit, contrasts)
+fit_contrasts <- eBayes(fit_contrasts)
+
+# Extract results for each contrast
+results_Geltrex_vs_Neurosphere_N <- topTable(fit_contrasts, coef="Geltrex_vs_Neurosphere_N", number=Inf)
+results_Geltrex_vs_Neurosphere_H <- topTable(fit_contrasts, coef="Geltrex_vs_Neurosphere_H", number=Inf)
+results_Geltrex_vs_Bioprint_N <- topTable(fit_contrasts, coef="Geltrex_vs_Bioprint_N", number=Inf)
+results_Geltrex_vs_Bioprint_H <- topTable(fit_contrasts, coef="Geltrex_vs_Bioprint_H", number=Inf)
+results_Geltrex_vs_Microtumor_N <- topTable(fit_contrasts, coef="Geltrex_vs_Microtumor_N", number=Inf)
+results_Geltrex_vs_Microtumor_H <- topTable(fit_contrasts, coef="Geltrex_vs_Microtumor_H", number=Inf)
+
+# Define a function to create volcano plot
+create_volcano_plot <- function(logFC, adjPVal_logFC, title) {
+  plot(logFC, -log10(adjPVal_logFC), pch=20, 
+       main=paste("Volcano Plot for", title), 
+       xlab="Log Fold Change", ylab="-log10(Adjusted P-Value)",
+       xlim=xlims, ylim=ylims,  # Custom limits for x-axis and y-axis
+       col=ifelse(adjPVal_logFC < 0.05, "red", "black"))
+  
+  abline(h=-log10(0.05), col="blue", lty=2)
+  abline(v=c(-1, 1), col="blue", lty=2)
+}
+
+# Custom limits for x-axis and y-axis
+xlims <- c(-10, 10)
+ylims <- c(0, 20)
+
+# Volcano plot for Geltrex vs. Neurosphere (Normoxia)
+create_volcano_plot(results_Geltrex_vs_Neurosphere_N$logFC, results_Geltrex_vs_Neurosphere_N$adj.P.Val, "JX39P Geltrex vs. Neurosphere (Normoxia)")
+
+# Volcano plot for Geltrex vs. Neurosphere (Hypoxia)
+create_volcano_plot(results_Geltrex_vs_Neurosphere_H$logFC, results_Geltrex_vs_Neurosphere_H$adj.P.Val, "JX39P Geltrex vs. Neurosphere (Hypoxia)")
+
+# Volcano plot for Geltrex vs. Bioprint (Normoxia)
+create_volcano_plot(results_Geltrex_vs_Bioprint_N$logFC, results_Geltrex_vs_Bioprint_N$adj.P.Val, "JX39P Geltrex vs. Bioprint (Normoxia)")
+
+# Volcano plot for Geltrex vs. Bioprint (Hypoxia)
+create_volcano_plot(results_Geltrex_vs_Bioprint_H$logFC, results_Geltrex_vs_Bioprint_H$adj.P.Val, "JX39P Geltrex vs. Bioprint (Hypoxia)")
+
+# Volcano plot for Geltrex vs. Microtumor (Normoxia)
+create_volcano_plot(results_Geltrex_vs_Microtumor_N$logFC, results_Geltrex_vs_Microtumor_N$adj.P.Val, "JX39P Geltrex vs. Microtumor (Normoxia)")
+
+# Volcano plot for Geltrex vs. Microtumor (Hypoxia)
+create_volcano_plot(results_Geltrex_vs_Microtumor_H$logFC, results_Geltrex_vs_Microtumor_H$adj.P.Val, "JX39P Geltrex vs. Microtumor (Hypoxia)")
+```
+
+## Under just normoxia-x1441 under four models(other lines) - 
+```{r}
+# Define contrasts
+contrasts <- makeContrasts(
+  Geltrex_vs_Neurosphere_N_X1441 = X1441_G_N - X1441_N_N,
+  Geltrex_vs_Bioprint_N_X1441 = X1441_G_N - X1441_B_N,
+  Geltrex_vs_Microtumor_N_X1441 = X1441_G_N - X1441_M_N,
+  Neurosphere_vs_Microtumor_N_X1441 = X1441_N_N - X1441_M_N,
+  Neurosphere_vs_Bioprint_N_X1441 = X1441_N_N - X1441_B_N,
+  Microtumor_vs_Bioprint_N_X1441 = X1441_M_N - X1441_B_N,
+  levels = design
+)
+
+# Fit contrasts
+fit_contrasts <- contrasts.fit(fit, contrasts)
+fit_contrasts <- eBayes(fit_contrasts)
+
+# Extract results for each contrast
+results_Geltrex_vs_Neurosphere_N_X1441 <- topTable(fit_contrasts, coef="Geltrex_vs_Neurosphere_N_X1441", number=Inf)
+results_Geltrex_vs_Bioprint_N_X1441 <- topTable(fit_contrasts, coef="Geltrex_vs_Bioprint_N_X1441", number=Inf)
+results_Geltrex_vs_Microtumor_N_X1441 <- topTable(fit_contrasts, coef="Geltrex_vs_Microtumor_N_X1441", number=Inf)
+results_Neurosphere_vs_Microtumor_N_X1441 <- topTable(fit_contrasts, coef="Neurosphere_vs_Microtumor_N_X1441", number=Inf)
+results_Neurosphere_vs_Bioprint_N_X1441 <- topTable(fit_contrasts, coef="Neurosphere_vs_Bioprint_N_X1441", number=Inf)
+results_Microtumor_vs_Bioprint_N_X1441 <- topTable(fit_contrasts, coef="Microtumor_vs_Bioprint_N_X1441", number=Inf)
+
+# Define a function to create volcano plot
+create_volcano_plot <- function(logFC, adjPVal_logFC, title, xlims, ylims) {
+  plot(logFC, -log10(adjPVal_logFC), pch=20, 
+       main=title, 
+       xlab="Log Fold Change", ylab="-log10(Adjusted P-Value)",
+       xlim=xlims, ylim=ylims,  # Custom limits for x-axis and y-axis
+       col=ifelse(adjPVal_logFC < 0.05, "red", "black"))
+  
+  abline(h=-log10(0.05), col="blue", lty=2)
+  abline(v=c(-1, 1), col="blue", lty=2)
+}
+
+# Custom limits for x-axis and y-axis
+xlims <- c(-10, 10)
+ylims <- c(0, 20)
+
+# Generate volcano plots
+create_volcano_plot(results_Geltrex_vs_Neurosphere_N_X1441$logFC, results_Geltrex_vs_Neurosphere_N_X1441$adj.P.Val, "Geltrex vs. Neurosphere (Normoxia) X1441", xlims, ylims)
+create_volcano_plot(results_Geltrex_vs_Bioprint_N_X1441$logFC, results_Geltrex_vs_Bioprint_N_X1441$adj.P.Val, "Geltrex vs. Bioprint (Normoxia) X1441", xlims, ylims)
+create_volcano_plot(results_Geltrex_vs_Microtumor_N_X1441$logFC, results_Geltrex_vs_Microtumor_N_X1441$adj.P.Val, "Geltrex vs. Microtumor (Normoxia) X1441", xlims, ylims)
+create_volcano_plot(results_Neurosphere_vs_Microtumor_N_X1441$logFC, results_Neurosphere_vs_Microtumor_N_X1441$adj.P.Val, "Neurosphere vs. Microtumor (Normoxia) X1441", xlims, ylims)
+create_volcano_plot(results_Neurosphere_vs_Bioprint_N_X1441$logFC, results_Neurosphere_vs_Bioprint_N_X1441$adj.P.Val, "Neurosphere vs. Bioprint (Normoxia) X1441", xlims, ylims)
+create_volcano_plot(results_Microtumor_vs_Bioprint_N_X1441$logFC, results_Microtumor_vs_Bioprint_N_X1441$adj.P.Val, "Microtumor vs. Bioprint (Normoxia) X1441", xlims, ylims)
+```
